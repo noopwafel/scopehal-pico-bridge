@@ -40,6 +40,9 @@
 		CHANS?
 			Returns the number of channels on the instrument.
 
+		[1|2]D:PRESENT?
+			Returns 1 = MSO pod present, 0 = MSO pod not present
+
 		[chan]:COUP [DC1M|AC1M|DC50]
 			Sets channel coupling
 
@@ -136,6 +139,11 @@ float g_triggerVoltage = 0;
 size_t g_triggerChannel = 0;
 size_t g_triggerSampleIndex;
 
+//Thresholds for MSO pods
+int16_t g_msoPodThreshold[2][8] = { {0}, {0} };
+PICO_DIGITAL_PORT_HYSTERESIS g_msoHysteresis[2] = {PICO_NORMAL_100MV, PICO_NORMAL_100MV};
+bool g_msoPodEnabled[2] = {false};
+
 void UpdateTrigger();
 void UpdateChannel(size_t chan);
 
@@ -222,8 +230,18 @@ void ScpiServerThread()
 			LogVerbose((line + "\n").c_str());
 
 			//Extract channel ID from subject and clamp bounds
-			size_t channelId = subject[0] - 'A';
-			channelId = min(channelId, g_numChannels);
+			size_t channelId = 0;
+			bool channelIsDigital = false;
+			if(isalpha(subject[0]))
+			{
+				channelId = min(static_cast<size_t>(subject[0] - 'A'), g_numChannels);
+				channelIsDigital = false;
+			}
+			else if(isdigit(subject[0]))
+			{
+				channelId = min(subject[0] - '0', 2) - 1;
+				channelIsDigital = true;
+			}
 
 			if(query)
 			{
@@ -258,7 +276,7 @@ void ScpiServerThread()
 						size_t maxSamples;
 						int32_t maxSamples_int;
 						PICO_STATUS status;
-
+						status = PICO_RESERVED_1;
 						if(g_pico_type == PICO6000A)
 							status = ps6000aGetTimebase(g_hScope, i, 1, &intervalNs, &maxSamples, 0);
 						else if(g_pico_type == PICO3000A)
@@ -291,7 +309,7 @@ void ScpiServerThread()
 					int32_t maxSamples_int;
 
 					PICO_STATUS status;
-
+					status = PICO_RESERVED_1;
 					//Ask for max memory depth at 1.25 Gsps. Why does legal memory depend on sample rate?
 					if(g_pico_type == PICO6000A)
 						status = ps6000aGetTimebase(g_hScope, 2, 1, &intervalNs, &maxSamples, 0);
@@ -320,6 +338,33 @@ void ScpiServerThread()
 					ScpiSend(client, ret);
 				}
 
+				else if(cmd == "PRESENT")
+				{
+					lock_guard<mutex> lock(g_mutex);
+
+					//There's no API to test for presence of a MSO pod without trying to enable it.
+					//If no pod is present, this call will return PICO_NO_MSO_POD_CONNECTED.
+					PICO_CHANNEL podId = (PICO_CHANNEL)(PICO_PORT0 + channelId);
+					auto status = ps6000aSetDigitalPortOn(
+						g_hScope,
+						podId,
+						g_msoPodThreshold[channelId],
+						8,
+						g_msoHysteresis[channelId]);
+
+					if(status == PICO_NO_MSO_POD_CONNECTED)
+						ScpiSend(client, "0");
+
+					//The pod is here. If we don't need it on, shut it back off
+					else
+					{
+						if(!g_msoPodEnabled[channelId])
+							ps6000aSetDigitalPortOff(g_hScope, podId);
+
+						ScpiSend(client, "1");
+					}
+				}
+
 				else
 					LogDebug("Unrecognized query received: %s\n", line.c_str());
 			}
@@ -330,14 +375,44 @@ void ScpiServerThread()
 			else if(cmd == "ON")
 			{
 				lock_guard<mutex> lock(g_mutex);
-				g_channelOn[channelId] = true;
-				UpdateChannel(channelId);
+
+				if(channelIsDigital)
+				{
+					PICO_CHANNEL podId = (PICO_CHANNEL)(PICO_PORT0 + channelId);
+					auto status = ps6000aSetDigitalPortOn(
+						g_hScope,
+						podId,
+						g_msoPodThreshold[channelId],
+						8,
+						g_msoHysteresis[channelId]);
+					if(status != PICO_OK)
+						LogError("ps6000aSetDigitalPortOn failed with code %x\n", status);
+					else
+						g_msoPodEnabled[channelId] = true;
+				}
+				else
+				{
+					g_channelOn[channelId] = true;
+					UpdateChannel(channelId);
+				}
+
 			}
 			else if(cmd == "OFF")
 			{
 				lock_guard<mutex> lock(g_mutex);
-				g_channelOn[channelId] = false;
-				UpdateChannel(channelId);
+
+				if(channelIsDigital)
+				{
+					PICO_CHANNEL podId = (PICO_CHANNEL)(PICO_PORT0 + channelId);
+					auto status = ps6000aSetDigitalPortOff(g_hScope, podId);
+					if(status != PICO_OK)
+						LogError("ps6000aSetDigitalPortOff failed with code %x\n", status);
+				}
+				else
+				{
+					g_channelOn[channelId] = false;
+					UpdateChannel(channelId);
+				}
 			}
 
 			else if( (cmd == "BITS") && (args.size() == 1) )
@@ -827,9 +902,10 @@ void StartCapture(bool stopFirst)
 
 	//TODO: implement g_triggerDelay
 
-	LogVerbose("StartCapture stopFirst %d memdepth %d\n", stopFirst, g_memDepth);
+	LogVerbose("StartCapture stopFirst %d memdepth %zu\n", stopFirst, g_memDepth);
 
 	PICO_STATUS status;
+	status = PICO_RESERVED_1;
 	switch(g_pico_type)
 	{
 	case PICO3000A:
